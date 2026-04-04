@@ -1,11 +1,18 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-
 from db import connect_db, disconnect_db
 from routes.workflow import router as workflow_router
 from config import settings
 from routes.glossary import router as glossary_router
+import sentry_sdk
+
+sentry_sdk.init(
+    dsn="https://6cfc65b040db2a0b64b0ac8dc08937ef@o4511161908068352.ingest.us.sentry.io/4511161977208832",
+    # Add data like request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

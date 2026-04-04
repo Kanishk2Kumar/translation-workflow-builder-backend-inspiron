@@ -1,6 +1,6 @@
 import asyncpg
 
-HARDCODED_DB_URL = "Hardcoded database URL here"
+HARDCODED_DB_URL =""
 
 _pool: asyncpg.Pool | None = None
 
