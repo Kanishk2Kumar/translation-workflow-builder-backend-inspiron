@@ -2,6 +2,11 @@ import httpx
 
 from config import settings
 from nodes.base import BaseNode
+from nodes.compliance_common import (
+    ensure_enforcement_plan,
+    protect_text_tokens,
+    restore_protected_text,
+)
 from nodes.llm_agent import restore_glossary
 
 _DEFAULT_AZURE_TRANSLATOR_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
@@ -41,6 +46,31 @@ def build_translation_batches(texts: list[str], max_items: int, max_chars: int) 
         batches.append(current_batch)
 
     return batches
+
+
+def build_translation_items(
+    pending_segments: list[str],
+    current_segments: list[str],
+    enforcement_plan: dict,
+) -> list[dict]:
+    items: list[dict] = []
+    rules = enforcement_plan.get("segment_rules", [])
+
+    for segment in pending_segments:
+        try:
+            index = current_segments.index(segment)
+        except ValueError:
+            index = -1
+
+        rule = rules[index] if 0 <= index < len(rules) else {}
+        items.append({
+            "index": index,
+            "segment": segment,
+            "skip_translation": bool(rule.get("skip_translation")),
+            "protected_tokens": list(rule.get("protected_tokens", [])),
+        })
+
+    return items
 
 
 async def translate_batch(
@@ -114,15 +144,27 @@ class AzureTranslateNode(BaseNode):
         text_type: str = self.config.get("text_type", "plain")
         category: str | None = self.config.get("category")
         glossary_map: dict[str, str] = context.get("glossary_map", {})
+        current_segments: list[str] = context.get("segments", [])
+        enforcement_plan = ensure_enforcement_plan(context)
 
         if rag_matches and all(
             match.get("match_type") == "exact" and match.get("matches")
             for match in rag_matches
         ):
-            segment_translations = {
-                match["segment"]: restore_glossary(match["matches"][0]["translation"], glossary_map)
-                for match in rag_matches
-            }
+            translation_items = build_translation_items(
+                pending_segments=[match["segment"] for match in rag_matches],
+                current_segments=current_segments,
+                enforcement_plan=enforcement_plan,
+            )
+            segment_translations = {}
+            for match, item in zip(rag_matches, translation_items):
+                if item["skip_translation"]:
+                    segment_translations[match["segment"]] = match["segment"]
+                    continue
+                segment_translations[match["segment"]] = restore_glossary(
+                    match["matches"][0]["translation"],
+                    glossary_map,
+                )
             translated_text = "\n".join(
                 segment_translations[match["segment"]] for match in rag_matches
             )
@@ -144,10 +186,18 @@ class AzureTranslateNode(BaseNode):
             for match in rag_matches:
                 segment = match["segment"]
                 if match.get("match_type") == "exact" and match.get("matches"):
-                    segment_translations[segment] = restore_glossary(
-                        match["matches"][0]["translation"],
-                        glossary_map,
-                    )
+                    item = build_translation_items(
+                        pending_segments=[segment],
+                        current_segments=current_segments,
+                        enforcement_plan=enforcement_plan,
+                    )[0]
+                    if item["skip_translation"]:
+                        segment_translations[segment] = segment
+                    else:
+                        segment_translations[segment] = restore_glossary(
+                            match["matches"][0]["translation"],
+                            glossary_map,
+                        )
                 else:
                     pending_segments.append(segment)
         elif segments:
@@ -157,21 +207,44 @@ class AzureTranslateNode(BaseNode):
             ordered_segments = [raw_text]
             pending_segments = [raw_text]
 
+        translation_items = build_translation_items(
+            pending_segments=pending_segments,
+            current_segments=current_segments,
+            enforcement_plan=enforcement_plan,
+        )
+
+        batchable_items = []
+        for item in translation_items:
+            if item["skip_translation"]:
+                segment_translations[item["segment"]] = item["segment"]
+            else:
+                batchable_items.append(item)
+
         for batch in build_translation_batches(
-            texts=pending_segments,
+            texts=[item["segment"] for item in batchable_items],
             max_items=batch_size,
             max_chars=max_batch_chars,
         ):
+            batch_items = []
+            for segment in batch:
+                item = next(candidate for candidate in batchable_items if candidate["segment"] == segment)
+                protected_text, placeholder_map = protect_text_tokens(segment, item["protected_tokens"])
+                batch_items.append({
+                    **item,
+                    "source_text": protected_text,
+                    "placeholder_map": placeholder_map,
+                })
             translated_batch = await translate_batch(
-                texts=batch,
+                texts=[item["source_text"] for item in batch_items],
                 target_language=target_language,
                 source_language=source_language,
                 text_type=text_type,
                 category=category,
             )
-            for source_text, translated in zip(batch, translated_batch):
+            for item, translated in zip(batch_items, translated_batch):
+                restored = restore_protected_text(translated, item["placeholder_map"])
                 print(f"DEBUG azure_translation: '{translated[:100]}'")
-                segment_translations[source_text] = restore_glossary(translated, glossary_map)
+                segment_translations[item["segment"]] = restore_glossary(restored, glossary_map)
 
         translated_text = "\n".join(
             segment_translations.get(segment, segment)

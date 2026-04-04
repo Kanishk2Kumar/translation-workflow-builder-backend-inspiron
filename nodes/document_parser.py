@@ -33,7 +33,15 @@ class DocumentParserNode(BaseNode):
                 block_type="paragraph",
                 source_text=raw_text,
             )]
-            return {**context, "document_blocks": blocks, "segments": [raw_text]}
+            segments = [raw_text] if raw_text else []
+            return {
+                **context,
+                "document_blocks": blocks,
+                "segments": segments,
+                "original_segments": segments.copy(),
+                "original_raw_text": raw_text,
+                "segment_count": len(segments),
+            }
 
         if filename.endswith(".docx"):
             blocks = self._parse_docx(file_bytes)
@@ -52,9 +60,11 @@ class DocumentParserNode(BaseNode):
             **context,
             "document_blocks": blocks,
             "segments": segments,
+            "original_segments": segments.copy(),
             "segment_count": len(segments),
             # Keep raw_text for backwards compat with plain-text workflows
             "raw_text": "\n".join(segments),
+            "original_raw_text": "\n".join(segments),
         }
 
     # ── DOCX ─────────────────────────────────────────────────────────────────
