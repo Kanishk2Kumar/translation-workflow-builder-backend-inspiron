@@ -1,6 +1,10 @@
 import asyncpg
+import os
+from dotenv import load_dotenv
 
-HARDCODED_DB_URL =""
+HARDCODED_DB_URL = ""
+load_dotenv()
+EFFECTIVE_DB_URL = os.getenv("DB_URL") or HARDCODED_DB_URL
 
 _pool: asyncpg.Pool | None = None
 
@@ -8,7 +12,7 @@ _pool: asyncpg.Pool | None = None
 async def connect_db():
     global _pool
     _pool = await asyncpg.create_pool(
-        dsn=HARDCODED_DB_URL,
+        dsn=EFFECTIVE_DB_URL,
         min_size=2,
         max_size=10,
         ssl="require",
