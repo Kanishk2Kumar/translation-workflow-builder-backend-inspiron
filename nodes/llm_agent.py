@@ -3,6 +3,11 @@ import re
 from openai import OpenAI
 
 from nodes.base import BaseNode
+from nodes.compliance_common import (
+    ensure_enforcement_plan,
+    protect_text_tokens,
+    restore_protected_text,
+)
 from config import settings
 
 _client: OpenAI | None = None
@@ -105,7 +110,7 @@ def build_batch_prompt(batch_items, target_language, tone, system_prompt, glossa
 
         item_blocks.append(
             f"<<<{item['id']}>>>\n"
-            f"Source text:\n{item['segment']}\n"
+            f"Source text:\n{item.get('source_for_translation', item['segment'])}\n"
             f"{reference_block}"
         )
 
@@ -271,6 +276,8 @@ class LLMAgentNode(BaseNode):
         rag_matches: list = context.get("rag_matches", [])
         batch_max_segments: int = self.config.get("batch_max_segments", 12)
         batch_max_chars: int = self.config.get("batch_max_chars", 4000)
+        segments: list[str] = context.get("segments", [])
+        enforcement_plan = ensure_enforcement_plan(context)
 
         client = get_openai_client()
         total_input_tokens = 0
@@ -284,10 +291,17 @@ class LLMAgentNode(BaseNode):
             m.get("match_type") == "exact" and m.get("matches")
             for m in rag_matches
         ):
-            segment_translations = {
-                m["segment"]: restore_glossary(m["matches"][0]["translation"], glossary_map)
-                for m in rag_matches
-            }
+            segment_translations = {}
+            rules = enforcement_plan.get("segment_rules", [])
+            for index, m in enumerate(rag_matches):
+                rule = rules[index] if index < len(rules) else {}
+                if rule.get("skip_translation"):
+                    segment_translations[m["segment"]] = m["segment"]
+                    continue
+                segment_translations[m["segment"]] = restore_glossary(
+                    m["matches"][0]["translation"],
+                    glossary_map,
+                )
             translated_text = "\n".join(
                 segment_translations[m["segment"]] for m in rag_matches
             )
@@ -305,23 +319,41 @@ class LLMAgentNode(BaseNode):
 
         if rag_matches:
             batch_items = []
+            rules = enforcement_plan.get("segment_rules", [])
             for index, match in enumerate(rag_matches, start=1):
                 segment = match["segment"]
+                rule = rules[index - 1] if index - 1 < len(rules) else {}
                 if match.get("match_type") == "exact" and match.get("matches"):
-                    segment_translations[segment] = restore_glossary(
-                        match["matches"][0]["translation"],
-                        glossary_map,
-                    )
+                    if rule.get("skip_translation"):
+                        segment_translations[segment] = segment
+                    else:
+                        segment_translations[segment] = restore_glossary(
+                            match["matches"][0]["translation"],
+                            glossary_map,
+                        )
                     continue
 
+                protected_source, placeholder_map = protect_text_tokens(
+                    segment,
+                    rule.get("protected_tokens", []),
+                )
                 batch_items.append({
                     "id": f"SEG_{index:04d}",
                     "segment": segment,
+                    "source_for_translation": segment if rule.get("skip_translation") else protected_source,
                     "match": match,
+                    "skip_translation": bool(rule.get("skip_translation")),
+                    "placeholder_map": placeholder_map,
                 })
 
+            skipped_items = [item for item in batch_items if item["skip_translation"]]
+            for item in skipped_items:
+                segment_translations[item["segment"]] = item["segment"]
+
+            translatable_items = [item for item in batch_items if not item["skip_translation"]]
+
             batches = build_translation_batches(
-                batch_items=batch_items,
+                batch_items=translatable_items,
                 max_batch_segments=batch_max_segments,
                 max_batch_chars=batch_max_chars,
             )
@@ -339,7 +371,18 @@ class LLMAgentNode(BaseNode):
                         glossary_terms=glossary_terms,
                         glossary_map=glossary_map,
                     )
-                    segment_translations.update(batch_translations)
+                    restored_batch = {
+                        item["segment"]: restore_protected_text(
+                            batch_translations[item["segment"]],
+                            item["placeholder_map"],
+                        )
+                        for item in batch
+                    }
+                    restored_batch = {
+                        key: restore_glossary(value, glossary_map)
+                        for key, value in restored_batch.items()
+                    }
+                    segment_translations.update(restored_batch)
                     total_input_tokens += prompt_tokens
                     total_output_tokens += completion_tokens
                 except Exception as e:
@@ -348,7 +391,7 @@ class LLMAgentNode(BaseNode):
                         try:
                             translation, prompt_tokens, completion_tokens = translate_single_segment(
                                 client=client,
-                                segment=item["segment"],
+                                segment=item["source_for_translation"],
                                 match=item["match"],
                                 target_language=target_language,
                                 tone=tone,
@@ -358,7 +401,8 @@ class LLMAgentNode(BaseNode):
                                 glossary_terms=glossary_terms,
                                 glossary_map=glossary_map,
                             )
-                            segment_translations[item["segment"]] = translation
+                            restored = restore_protected_text(translation, item["placeholder_map"])
+                            segment_translations[item["segment"]] = restore_glossary(restored, glossary_map)
                             total_input_tokens += prompt_tokens
                             total_output_tokens += completion_tokens
                         except Exception as inner_e:
@@ -371,8 +415,28 @@ class LLMAgentNode(BaseNode):
             )
 
         else:
+            rules = enforcement_plan.get("segment_rules", [])
+            if rules and rules[0].get("skip_translation"):
+                translated_text = raw_text
+                segment_translations = {}
+                total_input_tokens = 0
+                total_output_tokens = 0
+                return {
+                    **context,
+                    "translated_text": translated_text,
+                    "segment_translations": segment_translations,
+                    "llm_model": model,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "tm_hit": False,
+                }
+
+            protected_source, placeholder_map = protect_text_tokens(
+                raw_text,
+                rules[0].get("protected_tokens", []) if rules else [],
+            )
             system, user = build_prompt(
-                source_text=raw_text,
+                source_text=protected_source,
                 target_language=target_language,
                 tone=tone,
                 rag_matches=[],
@@ -389,7 +453,10 @@ class LLMAgentNode(BaseNode):
             )
             raw_translation = response.choices[0].message.content.strip()
             print(f"DEBUG raw_translation: '{raw_translation[:100]}'")
-            translated_text = restore_glossary(raw_translation, glossary_map)
+            translated_text = restore_glossary(
+                restore_protected_text(raw_translation, placeholder_map),
+                glossary_map,
+            )
             segment_translations = {}
             total_input_tokens = response.usage.prompt_tokens
             total_output_tokens = response.usage.completion_tokens

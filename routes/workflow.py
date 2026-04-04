@@ -13,6 +13,7 @@ from executor import execute_workflow
 from nodes.output import seed_translation_memory
 
 router = APIRouter(prefix="/workflow", tags=["workflow"])
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 class RunWorkflowResponse(BaseModel):
@@ -25,7 +26,17 @@ class RunWorkflowResponse(BaseModel):
 
 # ─── Text extraction ──────────────────────────────────────────────────────────
 
-def extract_text(filename: str, contents: bytes) -> str:
+def is_image_upload(filename: str, content_type: str | None = None) -> bool:
+    _, ext = os.path.splitext(filename.lower())
+    if ext in IMAGE_EXTENSIONS:
+        return True
+    return bool(content_type and content_type.startswith("image/"))
+
+
+def extract_text(filename: str, contents: bytes, content_type: str | None = None) -> str:
+    if is_image_upload(filename, content_type):
+        return ""
+
     if filename.endswith(".txt"):
         return contents.decode("utf-8", errors="ignore")
 
@@ -55,7 +66,10 @@ def extract_text(filename: str, contents: bytes) -> str:
 
     raise HTTPException(
         status_code=400,
-        detail=f"Unsupported file type: {filename}. Supported: .txt, .pdf, .docx",
+        detail=(
+            f"Unsupported file type: {filename}. Supported: .txt, .pdf, .docx, "
+            ".png, .jpg, .jpeg, .webp, .bmp, .tif, .tiff"
+        ),
     )
 
 
@@ -124,7 +138,7 @@ async def run_workflow(
             cache_hit=True,
         )
 
-    raw_text = extract_text(file.filename, contents)
+    raw_text = extract_text(file.filename, contents, file.content_type)
 
     row = await pool.fetchrow(
         "SELECT id, nodes, edges FROM workflows WHERE id = $1", workflow_id,
@@ -156,11 +170,14 @@ async def run_workflow(
 
     initial_context = {
         "raw_text": raw_text,
+        "original_raw_text": raw_text,
+        "original_segments": [raw_text] if raw_text else [],
         "file_bytes": contents,
         "target_language": target_language,
         "execution_id": execution_id,
         "workflow_id": workflow_id,
         "source_filename": file.filename,
+        "source_content_type": file.content_type or "",
         "document_hash": document_hash,
         "user_id": '37720c15-ff75-49eb-a538-b25fd2273d30',           # ← add this (from auth header once JWT is wired)
     }

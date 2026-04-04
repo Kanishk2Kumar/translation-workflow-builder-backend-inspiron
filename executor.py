@@ -3,9 +3,13 @@ from nodes.registry import NODE_REGISTRY
 
 NODE_PRIORITY = {
     "document_upload":    0,
+    "document_intelligence_ocr": 0,
     "document_parser":    0,
+    "google_vision_ocr":  0,
     "text_input":         0,
+    "ocr_confidence_gate": 1,
     "phi_detector":       1,
+    "compliance_enforcer": 1,
     "rag_tm":             2,
     "vector_db":          2,
     "glossary":           3,
@@ -23,6 +27,7 @@ NODE_PRIORITY = {
 
 # These node types must always run BEFORE llm_agent
 SUPPORT_NODE_TYPES = {"rag_tm", "vector_db"}
+TERMINAL_NODE_TYPES = {"output", "document_output"}
 
 
 def build_execution_order(nodes: list[dict], edges: list[dict]) -> list[str]:
@@ -97,6 +102,15 @@ async def execute_workflow(
         node_data = node_def.get("data", {})
         node_type = node_data.get("nodeType", "")
         node_config = node_data.get("config", {})
+
+        if context.get("_stop_workflow") and node_type not in TERMINAL_NODE_TYPES:
+            context["_logs"].append({
+                "node_id": node_id,
+                "node_type": node_type,
+                "status": "skipped",
+                "reason": "Workflow was stopped by an earlier gate node.",
+            })
+            continue
 
         NodeClass = NODE_REGISTRY.get(node_type)
 
