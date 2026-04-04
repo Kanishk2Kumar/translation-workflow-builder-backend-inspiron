@@ -40,14 +40,10 @@ async def add_term(user_id: str, term: GlossaryTermIn):
 
 
 @router.get("/{user_id}/terms")
-async def list_terms(user_id: str, target_lang: str | None = None):
+async def list_terms(user_id: str):
     pool = get_pool()
     query = "SELECT * FROM glossary_terms WHERE user_id = $1"
     args = [user_id]
-    if target_lang:
-        query += " AND target_lang = $2"
-        args.append(target_lang)
-    query += " ORDER BY source_term"
     rows = await pool.fetch(query, *args)
     return [dict(r) for r in rows]
 
