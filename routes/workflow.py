@@ -24,6 +24,32 @@ class RunWorkflowResponse(BaseModel):
     cache_hit: bool = False
 
 
+def _normalize_workflow_row(row) -> dict:
+    workflow = dict(row)
+    for key in ("nodes", "edges"):
+        value = workflow.get(key)
+        if isinstance(value, str):
+            try:
+                workflow[key] = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+    return workflow
+
+
+@router.get("/user/{user_id}")
+async def list_user_workflows(user_id: str):
+    pool = get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT *
+        FROM workflows
+        WHERE user_id = $1::uuid
+        """,
+        user_id,
+    )
+    return [_normalize_workflow_row(row) for row in rows]
+
+
 # ─── Text extraction ──────────────────────────────────────────────────────────
 
 def is_image_upload(filename: str, content_type: str | None = None) -> bool:
