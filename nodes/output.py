@@ -11,7 +11,20 @@ TRANSLATED_DOCS_DIR = "/tmp/translatio_outputs"
 os.makedirs(TRANSLATED_DOCS_DIR, exist_ok=True)
 
 
+def is_vector_dimension_mismatch_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "different vector dimensions" in message
+        or "expected 1024 dimensions, not 384" in message
+        or ("vector dimensions" in message and "expected" in message)
+    )
+
+
 def build_segment_payload(context: dict) -> list[dict]:
+    override_segments = context.get("output_segments_override")
+    if isinstance(override_segments, list):
+        return [dict(segment) for segment in override_segments]
+
     original_segments: list[str] = context.get("original_segments", []) or []
     segment_translations: dict = context.get("segment_translations", {}) or {}
 
@@ -48,6 +61,8 @@ async def seed_translation_memory(seed_payload: dict) -> None:
 
     try:
         pool = get_pool()
+        from nodes.rag_tm import clear_runtime_caches
+
         segments = list(segment_translations.keys())
         existing_rows = await pool.fetch(
             """
@@ -89,6 +104,7 @@ async def seed_translation_memory(seed_payload: dict) -> None:
             )
 
         if not missing_segments:
+            clear_runtime_caches()
             print(
                 "TM seeding complete: updated "
                 f"{len(existing_segments_to_update)} existing segments, inserted 0 new segments"
@@ -121,7 +137,35 @@ async def seed_translation_memory(seed_payload: dict) -> None:
             "TM seeding complete: updated "
             f"{len(existing_segments_to_update)} existing segments, inserted {len(rows)} new segments"
         )
+        clear_runtime_caches()
     except Exception as e:
+        if 'rows' in locals() and is_vector_dimension_mismatch_error(e):
+            try:
+                await pool.executemany(
+                    """
+                    INSERT INTO translation_memory
+                      (source_text, target_text, source_language, target_language, embedding)
+                    VALUES ($1, $2, $3, $4, NULL)
+                    """,
+                    [
+                        (
+                            segment,
+                            segment_translations[segment],
+                            source_language,
+                            target_language,
+                        )
+                        for segment in missing_segments
+                    ],
+                )
+                clear_runtime_caches()
+                print(
+                    "TM seeding fallback: inserted "
+                    f"{len(missing_segments)} segment(s) without embeddings because the DB still expects the old vector dimension. "
+                    "Exact-match TM will work, fuzzy/vector TM needs a DB embedding migration."
+                )
+                return
+            except Exception as fallback_exc:
+                print(f"TM seeding fallback failed: {fallback_exc}")
         print(f"TM seeding failed: {e}")
 
 

@@ -10,6 +10,9 @@ from pydantic import BaseModel
 
 from db import get_pool
 from executor import execute_workflow
+from nodes.document_parser import DocumentParserNode
+from nodes.document_rebuilder import DocumentRebuilderNode
+from nodes.output import OutputNode
 from nodes.output import seed_translation_memory
 
 router = APIRouter(prefix="/workflow", tags=["workflow"])
@@ -367,6 +370,183 @@ def _extract_segment_pairs_from_output(output: dict) -> list[dict]:
     }]
 
 
+def _apply_segment_edits(existing_segments: list[dict], edits: list[SegmentEditIn]) -> tuple[list[dict], int]:
+    updated_segments = [dict(segment) for segment in existing_segments]
+    edited_count = 0
+
+    for edit in edits:
+        idx = edit.segment_index - 1
+        if idx < 0 or idx >= len(updated_segments):
+            raise HTTPException(
+                status_code=400,
+                detail=f"segment_index {edit.segment_index} is out of range for this execution.",
+            )
+
+        current_segment = updated_segments[idx]
+        expected_source = current_segment.get("source_text", "")
+        if edit.source_text and expected_source and edit.source_text != expected_source:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"source_text mismatch for segment_index {edit.segment_index}. "
+                    "The segment no longer matches the stored execution output."
+                ),
+            )
+
+        current_segment["translated_text"] = edit.translated_text
+        current_segment["edited"] = True
+        edited_count += 1
+
+    return updated_segments, edited_count
+
+
+async def _create_manual_retranslation_execution(
+    *,
+    pool,
+    workflow_id: str,
+    parent_execution_id: str,
+    execution_input: dict,
+    parent_output: dict,
+    updated_segments: list[dict],
+) -> RunWorkflowResponse:
+    filename = execution_input.get("filename")
+    if not filename:
+        raise HTTPException(
+            status_code=409,
+            detail="Original filename is missing from this execution, so it cannot be rebuilt.",
+        )
+
+    source_file_bytes = _decode_execution_file_bytes(execution_input)
+    target_language = execution_input.get("target_language", parent_output.get("target_language", "hi"))
+    source_language = execution_input.get("source_language", parent_output.get("source_language", "en"))
+    document_hash = compute_hash(source_file_bytes, target_language)
+    execution_id = str(uuid.uuid4())
+
+    execution_input_payload = _serialize_execution_input(
+        filename=filename,
+        content_type=execution_input.get("content_type"),
+        target_language=target_language,
+        document_hash=document_hash,
+        contents=source_file_bytes,
+        extra={
+            "source_language": source_language,
+            "parent_execution_id": parent_execution_id,
+            "human_reviewed": True,
+            "human_review_segment_count": sum(1 for segment in updated_segments if segment.get("edited")),
+            "retranslation_mode": "manual_patch",
+        },
+    )
+
+    await pool.execute(
+        """
+        INSERT INTO executions (id, workflow_id, status, input, started_at)
+        VALUES ($1, $2, 'running', $3, $4)
+        """,
+        execution_id,
+        workflow_id,
+        json.dumps(execution_input_payload),
+        datetime.utcnow(),
+    )
+
+    parser = DocumentParserNode(node_id="manual_document_parser", config={})
+    parsed_context = await parser.run({
+        "source_filename": filename,
+        "file_bytes": source_file_bytes,
+        "raw_text": "",
+    })
+
+    document_blocks = parsed_context.get("document_blocks", [])
+    if len(document_blocks) != len(updated_segments):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Stored execution segments no longer match the parsed source document. "
+                "A full rerun would be required for this file."
+            ),
+        )
+
+    for block, segment in zip(document_blocks, updated_segments):
+        block.translated_text = segment.get("translated_text", "")
+
+    rebuilder = DocumentRebuilderNode(node_id="manual_document_rebuilder", config={})
+    if filename.endswith(".docx"):
+        output_document_bytes = rebuilder._rebuild_docx(document_blocks)
+        output_document_format = "docx"
+    elif filename.endswith(".pdf"):
+        output_document_bytes = rebuilder._rebuild_pdf(document_blocks, parsed_context)
+        output_document_format = "pdf"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Manual retranslation rebuild currently supports DOCX and PDF source files only.",
+        )
+
+    translated_text = "\n".join(segment.get("translated_text", "") for segment in updated_segments)
+    logs = [{
+        "node_id": "manual_review_patch",
+        "node_type": "manual_review_patch",
+        "status": "success",
+        "edited_segment_count": sum(1 for segment in updated_segments if segment.get("edited")),
+        "parent_execution_id": parent_execution_id,
+    }]
+
+    output_node = OutputNode(node_id="manual_output", config={"include_audit": True})
+    final_context = await output_node.run({
+        "_logs": logs,
+        "execution_id": execution_id,
+        "workflow_id": workflow_id,
+        "target_language": target_language,
+        "source_language": source_language,
+        "source_filename": filename,
+        "segment_count": len(updated_segments),
+        "translated_text": translated_text,
+        "llm_model": "human_review_patch",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tm_hit": False,
+        "output_document_bytes": output_document_bytes,
+        "output_document_format": output_document_format,
+        "rag_stats": parent_output.get("rag_stats", {}),
+        "review_required": False,
+        "review_reason": "Human segment edits applied without rerunning the workflow.",
+        "compliance_status": parent_output.get("compliance_status"),
+        "compliance_errors": parent_output.get("compliance_errors", []),
+        "compliance_suggestions": parent_output.get("compliance_suggestions", []),
+        "compliance_report": parent_output.get("compliance_report"),
+        "ocr_provider": parent_output.get("ocr_provider"),
+        "ocr_confidence": parent_output.get("ocr_confidence"),
+        "ocr_status": parent_output.get("ocr_status"),
+        "ocr_warnings": parent_output.get("ocr_warnings", []),
+        "original_segments": [segment.get("source_text", "") for segment in updated_segments],
+        "segment_translations": {},
+        "output_segments_override": updated_segments,
+    })
+
+    final_output = final_context.get("final_output", {})
+    final_output["segments"] = updated_segments
+    final_output["translated_text"] = translated_text
+    if output_document_bytes:
+        final_output["document_b64"] = base64.b64encode(output_document_bytes).decode("utf-8")
+
+    await pool.execute(
+        """
+        UPDATE executions
+        SET output = $1
+        WHERE id = $2
+        """,
+        json.dumps({k: v for k, v in final_output.items() if k != "document_b64"}),
+        execution_id,
+    )
+
+    return RunWorkflowResponse(
+        execution_id=execution_id,
+        status="success",
+        output=final_output,
+        logs=logs,
+        cache_hit=False,
+    )
+
+
 # ─── POST /workflow/{workflow_id}/run ─────────────────────────────────────────
 
 @router.post("/{workflow_id}/run", response_model=RunWorkflowResponse)
@@ -417,47 +597,38 @@ async def retranslate_workflow(
     background_tasks: BackgroundTasks,
 ):
     pool = get_pool()
+    if not request.segments:
+        raise HTTPException(status_code=400, detail="At least one edited segment is required.")
+
     row = await _load_execution_row(pool, workflow_id, execution_id)
     execution_input = json.loads(row["input"]) if isinstance(row["input"], str) else row["input"] or {}
-    target_language = execution_input.get("target_language", "hi")
-    source_language = execution_input.get("source_language", "en")
-
-    reviewed_tm_payload = _build_human_review_seed_payload(
-        segments=request.segments,
-        target_language=target_language,
-        source_language=source_language,
-    )
-    if not reviewed_tm_payload["segment_translations"]:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one edited segment with source_text and translated_text is required.",
-        )
-
-    await seed_translation_memory(reviewed_tm_payload)
-
-    filename = execution_input.get("filename")
-    if not filename:
+    parent_output = json.loads(row["output"]) if isinstance(row["output"], str) else row["output"] or {}
+    existing_segments = _extract_segment_pairs_from_output(parent_output)
+    if not existing_segments:
         raise HTTPException(
             status_code=409,
-            detail="Original filename is missing from this execution, so it cannot be retranslated.",
+            detail="This execution does not contain segment output, so manual retranslation cannot patch it.",
         )
 
-    return await _execute_workflow_run(
+    updated_segments, edited_count = _apply_segment_edits(existing_segments, request.segments)
+    reviewed_tm_payload = _build_human_review_seed_payload(
+        segments=request.segments,
+        target_language=execution_input.get("target_language", "hi"),
+        source_language=execution_input.get("source_language", "en"),
+    )
+    if reviewed_tm_payload["segment_translations"]:
+        background_tasks.add_task(seed_translation_memory, reviewed_tm_payload)
+
+    response = await _create_manual_retranslation_execution(
         pool=pool,
         workflow_id=workflow_id,
-        background_tasks=background_tasks,
-        contents=_decode_execution_file_bytes(execution_input),
-        filename=filename,
-        content_type=execution_input.get("content_type"),
-        target_language=target_language,
-        skip_cache=True,
-        execution_input_extra={
-            "source_language": source_language,
-            "parent_execution_id": execution_id,
-            "human_reviewed": True,
-            "human_review_segment_count": len(reviewed_tm_payload["segment_translations"]),
-        },
+        parent_execution_id=execution_id,
+        execution_input=execution_input,
+        parent_output=parent_output,
+        updated_segments=updated_segments,
     )
+    response.logs[0]["edited_segment_count"] = edited_count
+    return response
 
 
 

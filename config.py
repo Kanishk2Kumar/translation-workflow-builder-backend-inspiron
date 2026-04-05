@@ -4,6 +4,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     DB_URL: str
     OPENAI_API_KEY: str
+    REDIS_URL: str | None = None
+    EMBEDDING_CACHE_TTL_SECONDS: int = 86400
     AZURE_TRANSLATOR_KEY: str | None = None
     AZURE_TRANSLATOR_ENDPOINT: str | None = None
     AZURE_TRANSLATOR_REGION: str | None = None
