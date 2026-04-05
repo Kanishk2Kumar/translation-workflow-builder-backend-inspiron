@@ -562,6 +562,7 @@ async def _create_manual_retranslation_execution(
     final_output = final_context.get("final_output", {})
     final_output["segments"] = updated_segments
     final_output["translated_text"] = translated_text
+    final_output["full_translated_output"] = translated_text
     if output_document_bytes:
         final_output["document_b64"] = base64.b64encode(output_document_bytes).decode("utf-8")
 
