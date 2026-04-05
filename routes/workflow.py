@@ -6,7 +6,7 @@ from datetime import datetime
 import base64
 import os
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
 from db import get_pool
@@ -111,18 +111,6 @@ def _assert_workflow_auth_from_row(workflow_row, provided_auth_token: str | None
         )
 
 
-async def _load_workflow_auth_row(pool, workflow_id: str):
-    row = await pool.fetchrow(
-        """
-        SELECT id, auth_type, auth_token
-        FROM workflows
-        WHERE id = $1
-        """,
-        workflow_id,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
-    return row
 
 
 # ─── Text extraction ──────────────────────────────────────────────────────────
@@ -626,11 +614,8 @@ async def run_workflow(
 async def get_execution_segments(
     workflow_id: str,
     execution_id: str,
-    auth_token: str | None = Query(default=None),
 ):
     pool = get_pool()
-    workflow_row = await _load_workflow_auth_row(pool, workflow_id)
-    _assert_workflow_auth_from_row(workflow_row, auth_token)
     row = await _load_execution_row(pool, workflow_id, execution_id)
 
     execution_input = json.loads(row["input"]) if isinstance(row["input"], str) else row["input"] or {}
@@ -652,11 +637,8 @@ async def retranslate_workflow(
     execution_id: str,
     request: RetranslateExecutionRequest,
     background_tasks: BackgroundTasks,
-    auth_token: str | None = Query(default=None),
 ):
     pool = get_pool()
-    workflow_row = await _load_workflow_auth_row(pool, workflow_id)
-    _assert_workflow_auth_from_row(workflow_row, auth_token)
     if not request.segments:
         raise HTTPException(status_code=400, detail="At least one edited segment is required.")
 
@@ -696,14 +678,11 @@ async def retranslate_workflow(
 async def download_translated_document(
     workflow_id: str,
     execution_id: str,
-    auth_token: str | None = Query(default=None),
 ):
     import re
     from fastapi.responses import Response
 
     pool = get_pool()
-    workflow_row = await _load_workflow_auth_row(pool, workflow_id)
-    _assert_workflow_auth_from_row(workflow_row, auth_token)
     row = await pool.fetchrow(
         "SELECT output FROM executions WHERE id = $1 AND workflow_id = $2",
         execution_id, workflow_id,
