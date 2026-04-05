@@ -379,99 +379,14 @@ async def run_workflow(
     pool = get_pool()
     contents = await file.read()
 
-    document_hash = compute_hash(contents, target_language)
-
-    cached = await get_cached_execution(pool, document_hash, workflow_id)
-    if cached:
-        return RunWorkflowResponse(
-            execution_id=cached["execution_id"],
-            status="success",
-            output=cached["output"],
-            logs=[],
-            cache_hit=True,
-        )
-
-    raw_text = extract_text(file.filename, contents, file.content_type)
-
-    row = await pool.fetchrow(
-        "SELECT id, nodes, edges FROM workflows WHERE id = $1", workflow_id,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
-
-    nodes = json.loads(row["nodes"]) if isinstance(row["nodes"], str) else row["nodes"]
-    edges = json.loads(row["edges"]) if isinstance(row["edges"], str) else row["edges"]
-
-    if not nodes:
-        raise HTTPException(status_code=400, detail="Workflow has no nodes")
-
-    execution_id = str(uuid.uuid4())
-    await pool.execute(
-        """
-        INSERT INTO executions (id, workflow_id, status, input, started_at)
-        VALUES ($1, $2, 'running', $3, $4)
-        """,
-        execution_id,
-        workflow_id,
-        json.dumps({
-            "filename": file.filename,
-            "target_language": target_language,
-            "document_hash": document_hash,
-        }),
-        datetime.utcnow(),
-    )
-
-    initial_context = {
-        "raw_text": raw_text,
-        "original_raw_text": raw_text,
-        "original_segments": [raw_text] if raw_text else [],
-        "file_bytes": contents,
-        "target_language": target_language,
-        "execution_id": execution_id,
-        "workflow_id": workflow_id,
-        "source_filename": file.filename,
-        "source_content_type": file.content_type or "",
-        "document_hash": document_hash,
-        "user_id": '37720c15-ff75-49eb-a538-b25fd2273d30',           # ← add this (from auth header once JWT is wired)
-    }
-
-    try:
-        final_context = await execute_workflow(
-            nodes=nodes,
-            edges=edges,
-            initial_context=initial_context,
-        )
-    except Exception as e:
-        await pool.execute(
-            """
-            UPDATE executions
-            SET status = 'failed', logs = $1, completed_at = $2
-            WHERE id = $3
-            """,
-            json.dumps([{"error": str(e)}]),
-            datetime.utcnow(),
-            execution_id,
-        )
-        raise HTTPException(status_code=500, detail=f"Workflow execution failed: {str(e)}")
-
-    final_output = final_context.get("final_output", {})
-    logs = final_context.get("_logs", [])
-    tm_seed_payload = final_context.get("tm_seed_payload")
-
-    if tm_seed_payload:
-        background_tasks.add_task(seed_translation_memory, tm_seed_payload)
-
-    # Attach b64 directly to run response (not stored in DB)
-    output_doc_bytes = final_context.get("output_document_bytes")
-    if output_doc_bytes:
-        final_output["document_b64"] = base64.b64encode(output_doc_bytes).decode("utf-8")
-
-    return RunWorkflowResponse(
-        execution_id=execution_id,
-        status="success",
-        output=final_output,
-        logs=logs,
-        cache_hit=False,
+    return await _execute_workflow_run(
+        pool=pool,
+        workflow_id=workflow_id,
+        background_tasks=background_tasks,
+        contents=contents,
+        filename=file.filename,
+        content_type=file.content_type,
+        target_language=target_language,
     )
 
 # ─── GET /execution/{execution_id}/status ────────────────────────────────────
@@ -494,35 +409,23 @@ async def get_execution_segments(workflow_id: str, execution_id: str):
     )
 
 
-@router.post("/{workflow_id}/retranslate", response_model=RunWorkflowResponse)
+@router.post("/{workflow_id}/execution/{execution_id}/retranslate", response_model=RunWorkflowResponse)
 async def retranslate_workflow(
     workflow_id: str,
+    execution_id: str,
+    request: RetranslateExecutionRequest,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    edited_segments_json: str = Form(...),
-    target_language: str = Form(default="hi"),
 ):
     pool = get_pool()
-
-    try:
-        edited_segments_raw = json.loads(edited_segments_json)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="edited_segments_json must be a valid JSON array.",
-        ) from exc
-
-    try:
-        edited_segments = [SegmentEditIn(**item) for item in edited_segments_raw]
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Each edited segment must include segment_index, source_text, and translated_text.",
-        ) from exc
+    row = await _load_execution_row(pool, workflow_id, execution_id)
+    execution_input = json.loads(row["input"]) if isinstance(row["input"], str) else row["input"] or {}
+    target_language = execution_input.get("target_language", "hi")
+    source_language = execution_input.get("source_language", "en")
 
     reviewed_tm_payload = _build_human_review_seed_payload(
-        segments=edited_segments,
+        segments=request.segments,
         target_language=target_language,
+        source_language=source_language,
     )
     if not reviewed_tm_payload["segment_translations"]:
         raise HTTPException(
@@ -532,22 +435,30 @@ async def retranslate_workflow(
 
     await seed_translation_memory(reviewed_tm_payload)
 
-    contents = await file.read()
+    filename = execution_input.get("filename")
+    if not filename:
+        raise HTTPException(
+            status_code=409,
+            detail="Original filename is missing from this execution, so it cannot be retranslated.",
+        )
+
     return await _execute_workflow_run(
         pool=pool,
         workflow_id=workflow_id,
         background_tasks=background_tasks,
-        contents=contents,
-        filename=file.filename,
-        content_type=file.content_type,
+        contents=_decode_execution_file_bytes(execution_input),
+        filename=filename,
+        content_type=execution_input.get("content_type"),
         target_language=target_language,
         skip_cache=True,
         execution_input_extra={
-            "source_language": "en",
+            "source_language": source_language,
+            "parent_execution_id": execution_id,
             "human_reviewed": True,
             "human_review_segment_count": len(reviewed_tm_payload["segment_translations"]),
         },
     )
+
 
 
 @router.get("/{workflow_id}/execution/{execution_id}/download")
