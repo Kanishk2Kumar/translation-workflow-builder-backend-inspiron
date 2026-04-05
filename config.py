@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
     REDIS_URL: str | None = None
     EMBEDDING_CACHE_TTL_SECONDS: int = 86400
+    SUPABASE_URL: str | None = None
+    SUPABASE_SERVICE_ROLE_KEY: str | None = None
+    SUPABASE_STORAGE_BUCKET: str = "project-documents"
     AZURE_TRANSLATOR_KEY: str | None = None
     AZURE_TRANSLATOR_ENDPOINT: str | None = None
     AZURE_TRANSLATOR_REGION: str | None = None
@@ -20,6 +23,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
