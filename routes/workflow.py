@@ -1,11 +1,12 @@
 import hashlib
+import hmac
 import json
 import uuid
 from datetime import datetime
 import base64
 import os
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel
 
 from db import get_pool
@@ -54,6 +55,7 @@ class RetranslateExecutionRequest(BaseModel):
 
 def _normalize_workflow_row(row) -> dict:
     workflow = dict(row)
+    workflow.pop("auth_token", None)
     for key in ("nodes", "edges"):
         value = workflow.get(key)
         if isinstance(value, str):
@@ -69,13 +71,58 @@ async def list_user_workflows(user_id: str):
     pool = get_pool()
     rows = await pool.fetch(
         """
-        SELECT *
+        SELECT id, agent_id, nodes, edges, created_at, updated_at, name, description, user_id, auth_type
         FROM workflows
         WHERE user_id = $1::uuid
         """,
         user_id,
     )
     return [_normalize_workflow_row(row) for row in rows]
+
+
+def _normalize_auth_type(auth_type: str | None) -> str:
+    return (auth_type or "none").strip().lower()
+
+
+def _assert_workflow_auth_from_row(workflow_row, provided_auth_token: str | None) -> None:
+    auth_type = _normalize_auth_type(workflow_row.get("auth_type") if workflow_row else None)
+    if auth_type == "none":
+        return
+
+    if auth_type != "api_key":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported workflow auth_type '{auth_type}'.",
+        )
+
+    expected_token = (workflow_row.get("auth_token") or "").strip()
+    provided_token = (provided_auth_token or "").strip()
+
+    if not provided_token:
+        raise HTTPException(
+            status_code=401,
+            detail="This workflow requires an auth token.",
+        )
+
+    if not expected_token or not hmac.compare_digest(provided_token, expected_token):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid workflow auth token.",
+        )
+
+
+async def _load_workflow_auth_row(pool, workflow_id: str):
+    row = await pool.fetchrow(
+        """
+        SELECT id, auth_type, auth_token
+        FROM workflows
+        WHERE id = $1
+        """,
+        workflow_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+    return row
 
 
 # ─── Text extraction ──────────────────────────────────────────────────────────
@@ -233,10 +280,20 @@ async def _execute_workflow_run(
     filename: str,
     content_type: str | None,
     target_language: str,
+    auth_token: str | None = None,
     skip_cache: bool = False,
     execution_input_extra: dict | None = None,
 ) -> RunWorkflowResponse:
     document_hash = compute_hash(contents, target_language)
+
+    raw_text = extract_text(filename, contents, content_type)
+
+    row = await pool.fetchrow(
+        "SELECT id, nodes, edges, auth_type, auth_token FROM workflows WHERE id = $1", workflow_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+    _assert_workflow_auth_from_row(row, auth_token)
 
     if not skip_cache:
         cached = await get_cached_execution(pool, document_hash, workflow_id)
@@ -248,14 +305,6 @@ async def _execute_workflow_run(
                 logs=[],
                 cache_hit=True,
             )
-
-    raw_text = extract_text(filename, contents, content_type)
-
-    row = await pool.fetchrow(
-        "SELECT id, nodes, edges FROM workflows WHERE id = $1", workflow_id,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
 
     nodes = json.loads(row["nodes"]) if isinstance(row["nodes"], str) else row["nodes"]
     edges = json.loads(row["edges"]) if isinstance(row["edges"], str) else row["edges"]
@@ -555,6 +604,7 @@ async def run_workflow(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     target_language: str = Form(default="hi"),
+    auth_token: str | None = Form(default=None),
 ):
     pool = get_pool()
     contents = await file.read()
@@ -567,13 +617,20 @@ async def run_workflow(
         filename=file.filename,
         content_type=file.content_type,
         target_language=target_language,
+        auth_token=auth_token,
     )
 
 # ─── GET /execution/{execution_id}/status ────────────────────────────────────
 
 @router.get("/{workflow_id}/execution/{execution_id}/segments", response_model=ExecutionSegmentsResponse)
-async def get_execution_segments(workflow_id: str, execution_id: str):
+async def get_execution_segments(
+    workflow_id: str,
+    execution_id: str,
+    auth_token: str | None = Query(default=None),
+):
     pool = get_pool()
+    workflow_row = await _load_workflow_auth_row(pool, workflow_id)
+    _assert_workflow_auth_from_row(workflow_row, auth_token)
     row = await _load_execution_row(pool, workflow_id, execution_id)
 
     execution_input = json.loads(row["input"]) if isinstance(row["input"], str) else row["input"] or {}
@@ -595,8 +652,11 @@ async def retranslate_workflow(
     execution_id: str,
     request: RetranslateExecutionRequest,
     background_tasks: BackgroundTasks,
+    auth_token: str | None = Query(default=None),
 ):
     pool = get_pool()
+    workflow_row = await _load_workflow_auth_row(pool, workflow_id)
+    _assert_workflow_auth_from_row(workflow_row, auth_token)
     if not request.segments:
         raise HTTPException(status_code=400, detail="At least one edited segment is required.")
 
@@ -633,11 +693,17 @@ async def retranslate_workflow(
 
 
 @router.get("/{workflow_id}/execution/{execution_id}/download")
-async def download_translated_document(workflow_id: str, execution_id: str):
+async def download_translated_document(
+    workflow_id: str,
+    execution_id: str,
+    auth_token: str | None = Query(default=None),
+):
     import re
     from fastapi.responses import Response
 
     pool = get_pool()
+    workflow_row = await _load_workflow_auth_row(pool, workflow_id)
+    _assert_workflow_auth_from_row(workflow_row, auth_token)
     row = await pool.fetchrow(
         "SELECT output FROM executions WHERE id = $1 AND workflow_id = $2",
         execution_id, workflow_id,
