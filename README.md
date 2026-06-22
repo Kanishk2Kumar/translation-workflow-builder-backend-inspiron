@@ -1,6 +1,9 @@
 # Translatio Workflow Engine (Backend)
 
-This repository contains the backend engine for **Translatio**, an enterprise translation workflow platform built for healthcare and compliance-sensitive environments. This backend is responsible for workflow orchestration, document ingestion, inference, translation memory, glossary enforcement, compliance checking, and result output. The frontend/UI is not included here.
+This repository contains the backend engine for **Translatio**, an enterprise translation workflow platform built for healthcare and compliance-sensitive environments. This backend is responsible for workflow orchestration, document ingestion, inference, translation memory, glossary enforcement, compliance checking, and result output. 
+
+<img width="1500" height="458" alt="Screenshot 2026-06-22 223102" src="https://github.com/user-attachments/assets/7084deec-d418-4ac2-a185-9338c051a8f2" />
+
 
 ## Project overview
 
@@ -21,28 +24,11 @@ This repository contains the backend engine for **Translatio**, an enterprise tr
 - Persist workflow executions, logs, and glossary terms
 
 ## Architecture
+<img width="1198" height="677" alt="Screenshot 2026-06-22 223019" src="https://github.com/user-attachments/assets/8fd85d16-2302-4c4c-a836-7badf92b6050" />
 
-[Architecture Diagram]
+## Flow Diagram
+<img width="1216" height="665" alt="Screenshot 2026-05-31 174051" src="https://github.com/user-attachments/assets/541c5229-b99d-4aca-a3ee-6a883130eec3" />
 
-> Replace the placeholder above with an architecture diagram image or link.
-> Example: `![Architecture Diagram](./docs/architecture.png)`
-> For text-based architecture, use a Mermaid or PlantUML block.
-
-### Suggested architecture diagram placement
-
-- Add the system overview in this section.
-- Show components such as: `API gateway` → `FastAPI backend` → `Workflow executor` → `Node registry` → `Database / pgvector` → `Azure/OpenAI translation services` → `Supabase storage` → `Redis cache`.
-- Mark the diagram with labels like: `Backend API`, `Workflow Engine`, `Document Ingestion`, `PHI Protection`, `Glossary / TM`, `Compliance`, and `Output`.
-
-### Backend architecture details
-
-- `main.py` starts the FastAPI app and manages lifespan hooks for DB connect/disconnect
-- `routes/workflow.py` defines workflow execution, upload handling, and workflow metadata APIs
-- `routes/glossary.py` defines glossary term management APIs
-- `executor.py` runs workflow graphs using registered nodes
-- `nodes/` contains modular pipeline nodes for ingestion, OCR, PHI detection, translation, compliance, and output
-- `db.py` provides the PostgreSQL connection pool and access functions
-- `config.py` loads environment settings via `pydantic-settings`
 
 ## Key backend features
 
